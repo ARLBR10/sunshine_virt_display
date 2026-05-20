@@ -13,7 +13,7 @@
         in {
           default = pkgs.mkShell {
             packages = [
-              (pkgs.python3.withPackages (ps: [ ps.pytest ps.pytest-cov ]))
+              (pkgs.python3.withPackages (ps: [ ps.pytest ps.pytest-cov ps.jeepney ]))
             ];
           };
         }

@@ -1,0 +1,16 @@
+[Unit]
+Description=Sunshine Virtual Display Daemon
+After=display-manager.service dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/sunshine-vd/src/daemon/daemon.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

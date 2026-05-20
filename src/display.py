@@ -4,6 +4,7 @@ Connect and disconnect virtual displays by managing EDIDs and sysfs connector st
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from src.drm import (
@@ -33,6 +34,23 @@ def connect(width: int, height: int, refresh_rate: int, device: str | None = Non
     6. Wait for output to be ready
     """
     print(f"Connecting virtual display: {width}x{height}@{refresh_rate}Hz")
+
+    # If a previous session didn't clean up properly, the old virtual port still
+    # has its EDID override set and sysfs status "connected". Clear it now so it
+    # doesn't appear in connected_displays and end up in previous_displays.
+    state_file = SCRIPT_DIR / "virt_display.state"
+    if state_file.exists():
+        stale = state_file.read_text().strip().split("\n")
+        stale_card = stale[0] if len(stale) > 0 else ""
+        stale_port = stale[1] if len(stale) > 1 else ""
+        stale_edid = stale[3] if len(stale) > 3 else ""
+        if stale_card and stale_port:
+            print(f"  Stale session detected ({stale_card}-{stale_port}) — cleaning up...")
+            if stale_edid:
+                _ = run_command(f"sh -c 'cat /dev/null > {stale_edid}'")
+            _ = run_command(f"sh -c 'echo off > /sys/class/drm/{stale_card}-{stale_port}/status'")
+            time.sleep(0.5)  # let DRM process the hotplug before scanning
+        state_file.unlink()
 
     # Step 1: Generate custom EDID
     print("Step 1: Generating custom EDID...")
@@ -184,9 +202,11 @@ def connect(width: int, height: int, refresh_rate: int, device: str | None = Non
         else:
             print(f"  ⚠ Timed out waiting for output, proceeding anyway")
 
-    # Save state for disconnect
+    # Save state for disconnect (line 4 = edid_override_path for cleanup)
     state_file = SCRIPT_DIR / "virt_display.state"
-    _ = state_file.write_text(f"{card_name}\n{empty_port}\n{','.join(connected_displays)}")
+    _ = state_file.write_text(
+        f"{card_name}\n{empty_port}\n{','.join(connected_displays)}\n{edid_override_path}"
+    )
 
     print(f"\n✓ Virtual display successfully connected!")
     print(f"  Port: {card_name}-{empty_port}")
@@ -224,19 +244,46 @@ def disconnect() -> bool:
     # that can confuse the compositor (KWin crashes or stops rendering if
     # all outputs disappear at once).
     print("\nStep 1: Turning on previous displays...")
-    for display in previous_displays:
-        if display:
-            status_path = f"/sys/class/drm/{card_name}-{display}/status"
-            cmd = f"sh -c 'echo on > {status_path}'"
-            _ = run_command(cmd)
-            print(f"  ✓ Turned on {display}")
+    for disp in previous_displays:
+        if disp:
+            status_path = f"/sys/class/drm/{card_name}-{disp}/status"
+            _ = run_command(f"sh -c 'echo on > {status_path}'")
+            print(f"  ✓ Turned on {disp}")
 
-    # Step 2: Force CRTC assignment for restored displays
-    # On AMD, sysfs hotplug alone doesn't assign CRTCs
-    print("\nStep 2: Forcing CRTC assignment for restored displays...")
-    for display in previous_displays:
-        if display:
-            _ = force_crtc_assignment(card_name, display)
+    # Step 2: Force CRTC assignment and verify each display is actually up.
+    # On AMD, sysfs hotplug alone doesn't assign CRTCs. Retry up to 3 times
+    # with a short delay; only proceed past this step when all displays are
+    # confirmed active so the state file is never deleted on a partial restore.
+    print("\nStep 2: Restoring physical displays...")
+    all_restored = True
+    for disp in previous_displays:
+        if not disp:
+            continue
+
+        restored = False
+        for attempt in range(1, 4):
+            if attempt > 1:
+                print(f"  Retrying {disp} (attempt {attempt}/3)...")
+                time.sleep(2.0)
+
+            ok = force_crtc_assignment(card_name, disp)
+            if ok:
+                ready, mode = wait_for_output_ready(card_name, disp, 0, 0, timeout=5.0)
+                if ready:
+                    print(f"  ✓ {disp} restored ({mode})")
+                    restored = True
+                    break
+                print(f"  ⚠ {disp}: CRTC assigned but compositor has not picked it up yet")
+            else:
+                print(f"  ⚠ {disp}: CRTC assignment failed")
+
+        if not restored:
+            print(f"  ✗ {disp}: failed to restore after 3 attempts")
+            all_restored = False
+
+    if not all_restored:
+        print("\n✗ Not all displays restored — state file preserved so disconnect can be retried")
+        return False
 
     # Step 3: Release CRTC from virtual display and turn it off
     print(f"\nStep 3: Releasing CRTC from virtual display ({virtual_port})...")
@@ -244,13 +291,21 @@ def disconnect() -> bool:
 
     print(f"\nStep 4: Turning off virtual display ({virtual_port})...")
     status_path = f"/sys/class/drm/{card_name}-{virtual_port}/status"
-    cmd = f"sh -c 'echo off > {status_path}'"
-    result = run_command(cmd)
+    result = run_command(f"sh -c 'echo off > {status_path}'")
 
     if result.returncode != 0:
         print(f"  Warning: Could not turn off virtual display: {result.stderr}")
     else:
         print(f"  ✓ Virtual display turned off")
+
+    # Clear the EDID override so the port shows as disconnected on the next connect.
+    # Without this, a future connect() sees the port as connected and stores it in
+    # previous_displays, causing disconnect to try to restore a virtual port as if
+    # it were a physical display.
+    edid_override_path = state_data[3] if len(state_data) > 3 else ""
+    if edid_override_path:
+        _ = run_command(f"sh -c 'cat /dev/null > {edid_override_path}'")
+        print(f"  ✓ EDID override cleared")
 
     state_file.unlink()
 
