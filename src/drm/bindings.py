@@ -280,7 +280,8 @@ def _find_free_crtc(
 ) -> int:
     """
     Find a CRTC that can drive the given connector.
-    Prefers an inactive CRTC. Returns crtc_id or 0.
+    Returns a free compatible CRTC id, or 0 if every compatible CRTC is already
+    used by another connector.
     """
     r = res.contents
     conn = connector_p.contents
@@ -315,18 +316,6 @@ def _find_free_crtc(
             crtc_id: int = r.crtcs[ci]
             if crtc_id not in used_crtcs:
                 return crtc_id
-
-    # Fallback: steal any compatible CRTC (even if in use)
-    for ei in range(conn.count_encoders):
-        enc_p = libdrm.drmModeGetEncoder(fd, conn.encoders[ei])
-        if not enc_p:
-            continue
-        possible = enc_p.contents.possible_crtcs
-        libdrm.drmModeFreeEncoder(enc_p)
-
-        for ci in range(r.count_crtcs):
-            if possible & (1 << ci):
-                return r.crtcs[ci]
 
     return 0
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Virtual Display Manager for Linux
-Manages virtual displays by creating custom EDIDs and toggling display ports
+Manages virtual displays by creating custom EDIDs and toggling virtual display ports
 
 This script must be run with sudo privileges.
 Usage: echo "password" | sudo python3 main.py --connect --width 1920 --height 1080

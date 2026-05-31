@@ -1,9 +1,9 @@
 # Sunshine Virtual Display
 
 This tool creates virtual displays that match the client's resolution and refresh rate when streaming via Sunshine.
-It runs as a persistent daemon and automatically manages display connections by overriding EDID information and toggling display status.
+It runs as a persistent daemon and creates an additional virtual display by overriding EDID information on an unused connector.
 
-> ⚠️ Enable SSH before using this tool. If your display gets stuck, you can recover by running `sudo systemctl stop sunshineVD` or sending `--disconnect` to the socket.
+> ⚠️ Enable SSH before using this tool. If the virtual display gets stuck, you can recover by running `sudo systemctl stop sunshineVD` or sending `--disconnect` to the socket.
 
 ## Upgrading from v1
 
@@ -95,12 +95,6 @@ sh -c "echo --connect,--width,${SUNSHINE_CLIENT_WIDTH},--height,${SUNSHINE_CLIEN
 sh -c "echo --disconnect | socat - UNIX-CONNECT:/tmp/sunshineVD.sock"
 ```
 
-### NVIDIA + Hyprland
-
-On NVIDIA/Hyprland systems, the daemon avoids directly stealing/reassigning CRTCs for physical outputs. Instead, it uses Hyprland monitor commands to hide physical displays while the virtual display is active, then restores the original monitor configuration on disconnect.
-
-The restore state is built from `hyprctl -j monitors`, preserving the live mode, position, scale, bit depth (8-bit/10-bit), and active VRR state reported by Hyprland.
-
 ### Multi-GPU systems
 
 On systems with both an integrated GPU (iGPU) and a discrete GPU (dGPU), the daemon automatically selects the card with the most connected displays. Override with the `-d` flag if it picks the wrong one:
@@ -145,22 +139,19 @@ The dev service uses `Restart=no` so crashes surface immediately rather than bei
 2. Generates a custom EDID matching the client's display parameters
 3. Finds the first available empty display slot (prefers DisplayPort, falls back to HDMI)
 4. Overrides EDID for that slot via debugfs
-5. Releases CRTCs from and turns off all connected physical displays
-   - On NVIDIA/Hyprland, uses compositor-safe Hyprland monitor commands instead of direct DRM CRTC stealing
+5. Leaves all connected physical displays enabled
 6. Enables the virtual display
-7. Waits for the compositor to assign a CRTC, or forces one if it doesn't
-   - On NVIDIA/Hyprland, it refuses to force a direct DRM CRTC assignment and aborts instead
+7. Waits for the compositor to assign a CRTC, or uses a free CRTC if one is available
 
 ### On Disconnect
 
 1. Daemon receives `--disconnect`
-2. Turns physical displays back on and forces CRTC assignment
-   - On NVIDIA/Hyprland, restores the saved live Hyprland monitor specs from `hyprctl -j monitors`
-3. Releases the CRTC from and turns off the virtual display
+2. Releases the CRTC from and turns off the virtual display
+3. Clears the EDID override
 
 ### On Sunshine Crash or Stop
 
-The daemon watches `sunshine.service` via the systemd DBus interface. When Sunshine's `ActiveState` becomes `inactive` or `failed`, the daemon automatically disconnects the virtual display so physical monitors are restored without manual intervention.
+The daemon watches `sunshine.service` via the systemd DBus interface. When Sunshine's `ActiveState` becomes `inactive` or `failed`, the daemon automatically disconnects the virtual display.
 
 ### On System Sleep / Wake
 
@@ -168,7 +159,7 @@ The daemon holds a systemd sleep inhibitor lock so it can clean up before the sy
 
 ### On Shutdown
 
-Both `PrepareForShutdown` (via DBus) and SIGTERM trigger a graceful disconnect before the process exits, so physical displays are restored even if Sunshine didn't send an undo command.
+Both `PrepareForShutdown` (via DBus) and SIGTERM trigger a graceful virtual display disconnect before the process exits, even if Sunshine didn't send an undo command.
 
 ## Known Issues
 

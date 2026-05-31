@@ -277,7 +277,7 @@ class TestFindFreeCrtc:
         result = _find_free_crtc(lib, 5, res, conn_p)
         assert result == 0
 
-    def test_falls_back_to_used_crtc(self):
+    def test_returns_zero_when_only_used_crtc_is_compatible(self):
         lib = _make_mock_libdrm()
         res = _make_res([1, 2], [100])
 
@@ -316,8 +316,7 @@ class TestFindFreeCrtc:
         lib.drmModeGetEncoder.side_effect = get_encoder
 
         result = _find_free_crtc(lib, 5, res, conn_p)
-        # fallback: returns crtc_id=100 anyway
-        assert result == 100
+        assert result == 0
 
 
 class TestProbeConnector:

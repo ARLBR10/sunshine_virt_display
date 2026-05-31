@@ -3,11 +3,11 @@
 import json
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.drm.de.kwin import clear_kwin_output_config
+from src.drm.de.kwin import clear_kwin_output_config, disable_kwin_output
 
 
 class TestClearKwinOutputConfig:
@@ -111,3 +111,19 @@ class TestClearKwinOutputConfig:
                 clear_kwin_output_config("DP-1")
 
         assert "Warning" in capsys.readouterr().out
+
+
+class TestDisableKwinOutput:
+    def test_returns_false_without_session_users(self):
+        with patch("src.drm.de.kwin._session_users", return_value=[]):
+            assert disable_kwin_output("DP-1") is False
+
+    def test_runs_kscreen_doctor_as_session_user(self):
+        result = MagicMock(returncode=0, stdout="", stderr="")
+        runtime = Path("/run/user/1000")
+        with patch("src.drm.de.kwin._session_users", return_value=[("alice", 1000, runtime)]), \
+             patch("subprocess.run", return_value=result) as mock_run:
+            assert disable_kwin_output("DP-1") is True
+
+        args = mock_run.call_args[0][0]
+        assert args == ["runuser", "-u", "alice", "--", "kscreen-doctor", "output.DP-1.disable"]

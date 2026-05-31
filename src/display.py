@@ -4,7 +4,6 @@ Connect and disconnect virtual displays by managing EDIDs and sysfs connector st
 
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
@@ -18,29 +17,30 @@ from src.drm import (
     run_command,
     wait_for_output_ready,
 )
-from src.drm.de import hyprland
-from src.drm.de.kwin import clear_kwin_output_config
+from src.drm.de.kwin import clear_kwin_output_config, disable_kwin_output
 from src.edid import create_edid, find_best_vic_resolution, get_pixel_clock_info
 
 SCRIPT_DIR = Path(__file__).parent.parent.absolute()
 
 
-def _card_driver(card_name: str) -> str:
-    """Return the kernel driver/module name for a DRM card, if known."""
-    driver = Path(f"/sys/class/drm/{card_name}/device/driver")
-    try:
-        return driver.resolve().name.lower()
-    except OSError:
-        return ""
+def _find_virtual_display_from_edid() -> tuple[str, str, Path] | None:
+    """Find a connected output whose EDID matches this tool's generated EDID."""
+    edid_file = SCRIPT_DIR / "custom_edid.bin"
+    if not edid_file.exists():
+        return None
 
+    expected = edid_file.read_bytes()
+    for drm_device in get_drm_devices():
+        card_name = get_card_name_from_device(drm_device)
+        for port in get_connected_displays(card_name):
+            sysfs_edid = Path(f"/sys/class/drm/{card_name}-{port}/edid")
+            try:
+                if sysfs_edid.read_bytes() == expected:
+                    return card_name, port, drm_device / port / "edid_override"
+            except OSError:
+                continue
 
-def _use_hyprland_safe_path(card_name: str) -> bool:
-    """
-    On NVIDIA + Hyprland, direct DRM CRTC stealing/reassignment can leave a
-    physical output stuck at 0x0 after Sunshine disconnects. Prefer compositor
-    monitor commands there; keep the old DRM path for other compositors/drivers.
-    """
-    return "nvidia" in _card_driver(card_name) and hyprland.available()
+    return None
 
 
 def connect(width: int, height: int, refresh_rate: int, device: str | None = None) -> bool:
@@ -49,15 +49,14 @@ def connect(width: int, height: int, refresh_rate: int, device: str | None = Non
     1. Generate custom EDID
     2. Find empty display slot
     3. Override EDID
-    4. Turn off connected displays
-    5. Turn on virtual display
-    6. Wait for output to be ready
+    4. Turn on virtual display
+    5. Wait for output to be ready
     """
     print(f"Connecting virtual display: {width}x{height}@{refresh_rate}Hz")
 
     # If a previous session didn't clean up properly, the old virtual port still
-    # has its EDID override set and sysfs status "connected". Clear it now so it
-    # doesn't appear in connected_displays and end up in previous_displays.
+    # has its EDID override set and sysfs status "connected". Clear it before
+    # selecting a new empty slot.
     state_file = SCRIPT_DIR / "virt_display.state"
     if state_file.exists():
         stale = state_file.read_text().strip().split("\n")
@@ -180,31 +179,7 @@ def connect(width: int, height: int, refresh_rate: int, device: str | None = Non
 
     print(f"  ✓ EDID override applied")
 
-    hyprland_safe = _use_hyprland_safe_path(card_name)
-    hyprland_restore_specs: dict[str, dict[str, object]] = {}
-
-    if hyprland_safe:
-        print("\nStep 5: NVIDIA/Hyprland detected — using compositor-safe monitor toggles")
-        hyprland_restore_specs = hyprland.monitor_specs(connected_displays)
-        missing_specs = sorted(set(connected_displays) - set(hyprland_restore_specs))
-        if missing_specs:
-            print(f"  Error: Could not capture Hyprland restore state for: {', '.join(missing_specs)}")
-            print("  Refusing to hide physical outputs without a known-good restore plan")
-            return False
-        print("  Physical outputs will be hidden via Hyprland, not by stealing DRM CRTCs")
-    else:
-        # Turn off all connected displays and explicitly release their CRTCs.
-        # On AMD, echo off > status marks the connector disconnected in sysfs but
-        # the compositor keeps the CRTC active.  Without an explicit CRTC release
-        # the compositor continues rendering to the old displays, Sunshine sees
-        # multiple monitors, and uses the wrong one.
-        print("\nStep 5: Turning off connected displays...")
-        for display in connected_displays:
-            _ = release_crtc(card_name, display)
-            status_path = f"/sys/class/drm/{card_name}-{display}/status"
-            cmd = f"sh -c 'echo off > {status_path}'"
-            _ = run_command(cmd)
-            print(f"  ✓ Turned off {display}")
+    print("\nStep 5: Leaving existing displays enabled")
 
     # Step 6: Clear any stale KWin output config, then turn on virtual display
     print(f"\nStep 6: Preparing virtual display ({empty_port})...")
@@ -220,45 +195,28 @@ def connect(width: int, height: int, refresh_rate: int, device: str | None = Non
 
     print(f"  ✓ Virtual display enabled on {empty_port}")
 
-    # Step 7: Wait for compositor to assign CRTC naturally, then fall back to forcing.
-    # Do not force with direct DRM on NVIDIA/Hyprland; that is the path that can
-    # leave physical monitors stuck at 0x0 after disconnect.
+    # Step 7: Wait for compositor to assign CRTC naturally, then fall back to forcing
+    # a free CRTC. The DRM helper refuses to steal CRTCs already used by other outputs.
     print(f"\nStep 7: Waiting for output to be ready...")
     ready, mode = wait_for_output_ready(card_name, empty_port, width, height, timeout=5.0)
 
     if ready:
         print(f"  ✓ Output ready ({mode})")
-    elif hyprland_safe:
-        print("  ✗ Timed out waiting for virtual output; refusing to hide physical outputs")
-        _ = run_command(f"sh -c 'echo off > /sys/class/drm/{card_name}-{empty_port}/status'")
-        _ = run_command(f"sh -c 'cat /dev/null > {edid_override_path}'")
-        return False
     else:
-        print(f"  ⚠ Compositor did not assign CRTC — forcing assignment...")
-        _ = force_crtc_assignment(card_name, empty_port)
+        print(f"  ⚠ Compositor did not assign CRTC — trying a free CRTC...")
+        forced = force_crtc_assignment(card_name, empty_port)
         ready, mode = wait_for_output_ready(card_name, empty_port, width, height, timeout=5.0)
-        if ready:
+        if forced and ready:
             print(f"  ✓ Output ready ({mode})")
         else:
-            print(f"  ⚠ Timed out waiting for output, proceeding anyway")
-
-    if hyprland_safe and connected_displays:
-        print("\nStep 8: Hiding physical outputs via Hyprland...")
-        if hyprland.disable_outputs(connected_displays):
-            print(f"  ✓ Hidden: {', '.join(connected_displays)}")
-        else:
-            print("  ✗ Could not hide one or more physical outputs — cleaning up virtual display")
+            print("  ✗ Could not assign a free CRTC to the virtual display — cleaning up")
             _ = run_command(f"sh -c 'echo off > /sys/class/drm/{card_name}-{empty_port}/status'")
             _ = run_command(f"sh -c 'cat /dev/null > {edid_override_path}'")
             return False
 
-    # Save state for disconnect (line 4 = edid_override_path for cleanup,
-    # line 5 = Hyprland restore JSON when compositor-safe path was used)
+    # Save only the virtual display state; physical displays are never disabled.
     state_file = SCRIPT_DIR / "virt_display.state"
-    _ = state_file.write_text(
-        f"{card_name}\n{empty_port}\n{','.join(connected_displays)}\n{edid_override_path}\n"
-        f"{json.dumps(hyprland_restore_specs)}"
-    )
+    _ = state_file.write_text(f"{card_name}\n{empty_port}\n\n{edid_override_path}\n")
 
     print(f"\n✓ Virtual display successfully connected!")
     print(f"  Port: {card_name}-{empty_port}")
@@ -270,108 +228,89 @@ def connect(width: int, height: int, refresh_rate: int, device: str | None = Non
 def disconnect() -> bool:
     """
     Disconnect virtual display:
-    1. Turn off virtual display
-    2. Turn on previously connected displays
+    1. Release the virtual display CRTC
+    2. Turn off virtual display
+    3. Clear the EDID override
     """
     print("Disconnecting virtual display...")
 
     state_file = SCRIPT_DIR / "virt_display.state"
     if not state_file.exists():
-        print("Error: No state file found. Was a virtual display connected?")
-        return False
+        print("No state file found; scanning for matching virtual display EDID...")
+        recovered = _find_virtual_display_from_edid()
+        if not recovered:
+            print("Error: No state file or matching virtual display found")
+            return False
+        card_name, virtual_port, edid_override_path = recovered
+    else:
+        state_data = state_file.read_text().strip().split("\n")
+        if len(state_data) < 2:
+            print("Error: Invalid state file")
+            return False
 
-    state_data = state_file.read_text().strip().split("\n")
-    if len(state_data) < 2:
-        print("Error: Invalid state file")
-        return False
+        card_name = state_data[0]
+        virtual_port = state_data[1]
+        edid_override_path = state_data[3] if len(state_data) > 3 else ""
 
-    card_name = state_data[0]
-    virtual_port = state_data[1]
-    previous_displays = state_data[2].split(",") if len(state_data) > 2 and state_data[2] else []
-    try:
-        hyprland_restore_specs = json.loads(state_data[4]) if len(state_data) > 4 and state_data[4] else {}
-    except json.JSONDecodeError:
-        hyprland_restore_specs = {}
-    hyprland_safe = bool(hyprland_restore_specs)
+        if not edid_override_path:
+            recovered = _find_virtual_display_from_edid()
+            if recovered and recovered[0] == card_name and recovered[1] == virtual_port:
+                edid_override_path = recovered[2]
 
     print(f"  Virtual display: {card_name}-{virtual_port}")
-    print(f"  Previous displays: {previous_displays if previous_displays else 'None'}")
 
-    if hyprland_safe:
-        print("\nStep 1: Restoring physical outputs via Hyprland...")
-        if hyprland.restore_outputs(hyprland_restore_specs):
-            print(f"  ✓ Restored: {', '.join(hyprland_restore_specs.keys())}")
-        else:
-            print("\n✗ Hyprland restore failed — state file preserved so disconnect can be retried")
+    print(f"\nStep 1: Disabling compositor output ({virtual_port})...")
+    if not disable_kwin_output(virtual_port):
+        print("  ⚠ KScreen disable was not available or did not accept the output")
+
+    print(f"\nStep 2: Releasing CRTC from virtual display ({virtual_port})...")
+    _ = release_crtc(card_name, virtual_port)
+
+    print("\nStep 3: Clearing EDID override...")
+    if edid_override_path:
+        result = run_command(f"sh -c 'cat /dev/null > {edid_override_path}'")
+        if result.returncode != 0:
+            print(f"  Error: Could not clear EDID override: {result.stderr}")
+            print("  State file preserved so disconnect can be retried")
             return False
+        print(f"  ✓ EDID override cleared")
     else:
-        # Turn on physical displays FIRST — avoid a zero-output window
-        # that can confuse the compositor (KWin crashes or stops rendering if
-        # all outputs disappear at once).
-        print("\nStep 1: Turning on previous displays...")
-        for disp in previous_displays:
-            if disp:
-                status_path = f"/sys/class/drm/{card_name}-{disp}/status"
-                _ = run_command(f"sh -c 'echo on > {status_path}'")
-                print(f"  ✓ Turned on {disp}")
-
-        # Force CRTC assignment and verify each display is actually up.
-        # On AMD, sysfs hotplug alone doesn't assign CRTCs. Retry up to 3 times
-        # with a short delay; only proceed past this step when all displays are
-        # confirmed active so the state file is never deleted on a partial restore.
-        print("\nStep 2: Restoring physical displays...")
-        all_restored = True
-        for disp in previous_displays:
-            if not disp:
-                continue
-
-            restored = False
-            for attempt in range(1, 4):
-                if attempt > 1:
-                    print(f"  Retrying {disp} (attempt {attempt}/3)...")
-                    time.sleep(2.0)
-
-                ok = force_crtc_assignment(card_name, disp)
-                if ok:
-                    ready, mode = wait_for_output_ready(card_name, disp, 0, 0, timeout=5.0)
-                    if ready:
-                        print(f"  ✓ {disp} restored ({mode})")
-                        restored = True
-                        break
-                    print(f"  ⚠ {disp}: CRTC assigned but compositor has not picked it up yet")
-                else:
-                    print(f"  ⚠ {disp}: CRTC assignment failed")
-
-            if not restored:
-                print(f"  ✗ {disp}: failed to restore after 3 attempts")
-                all_restored = False
-
-        if not all_restored:
-            print("\n✗ Not all displays restored — state file preserved so disconnect can be retried")
-            return False
-
-        print(f"\nStep 3: Releasing CRTC from virtual display ({virtual_port})...")
-        _ = release_crtc(card_name, virtual_port)
+        print("  ⚠ No EDID override path in state file")
 
     print(f"\nStep 4: Turning off virtual display ({virtual_port})...")
     status_path = f"/sys/class/drm/{card_name}-{virtual_port}/status"
     result = run_command(f"sh -c 'echo off > {status_path}'")
 
     if result.returncode != 0:
-        print(f"  Warning: Could not turn off virtual display: {result.stderr}")
-    else:
-        print(f"  ✓ Virtual display turned off")
+        print(f"  Error: Could not turn off virtual display: {result.stderr}")
+        print("  State file preserved so disconnect can be retried")
+        return False
 
-    # Clear the EDID override so the port shows as disconnected on the next connect.
-    # Without this, a future connect() sees the port as connected and stores it in
-    # previous_displays, causing disconnect to try to restore a virtual port as if
-    # it were a physical display.
-    edid_override_path = state_data[3] if len(state_data) > 3 else ""
-    if edid_override_path:
-        _ = run_command(f"sh -c 'cat /dev/null > {edid_override_path}'")
-        print(f"  ✓ EDID override cleared")
+    # Some compositors keep the old CRTC alive until after the connector has
+    # been hot-unplugged. Release again after echoing off to make removal stick.
+    _ = release_crtc(card_name, virtual_port)
 
-    state_file.unlink()
+    sysfs_status = Path(status_path)
+    disconnected = False
+    for _ in range(10):
+        try:
+            if sysfs_status.read_text().strip() != "connected":
+                disconnected = True
+                break
+        except OSError:
+            disconnected = True
+            break
+        time.sleep(0.2)
+
+    if not disconnected:
+        print("  Error: Virtual display is still reported connected")
+        print("  State file preserved so disconnect can be retried")
+        return False
+
+    print(f"  ✓ Virtual display turned off")
+
+    if state_file.exists():
+        state_file.unlink()
 
     print("\n✓ Virtual display disconnected!")
     return True
