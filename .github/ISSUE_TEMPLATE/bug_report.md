@@ -31,7 +31,7 @@ If applicable, add screenshots to help explain your problem.
  - sunshine_virt_display version: [run `git status` e.g. "HEAD detached at v1.1.0"]
 
 **Debug Output**
-<!-- Paste result of `python ./script/debug_virt_display.py` below. -->
+<!-- Paste result of `python ./scripts/debug_virt_display.py` below. -->
 ```
 
 ```
